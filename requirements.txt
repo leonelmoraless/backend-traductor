@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+faster-whisper
+gTTS
+python-multipart
+deep-translator
+langdetect

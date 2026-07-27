@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+env/
+venv/
+pyvenv.cfg
+Include/
+Lib/
+Scripts/
+share/
+
+# Logs
+*.log
