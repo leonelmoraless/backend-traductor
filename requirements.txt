@@ -1,16 +1,8 @@
 fastapi
 uvicorn[standard]
-<<<<<<< HEAD
 faster-whisper
-gTTS
-python-multipart
-deep-translator
-langdetect
-=======
-openai-whisper
 deep-translator
 gTTS
 python-multipart
 pydantic-settings
 langdetect==1.0.9
->>>>>>> 1dbc4a9 (Update for langdetect)
