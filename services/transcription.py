@@ -1,5 +1,6 @@
 """
-Servicio de transcripción con faster-whisper (modelo tiny - optimizado para Render Free).
+Servicio de transcripción ultra-rápido para Render Free Tier.
+Utiliza SpeechRecognition (Google Web Speech API) para 0MB de overhead de RAM.
 """
 
 from __future__ import annotations
@@ -8,13 +9,11 @@ import logging
 import os
 import re
 import tempfile
+import speech_recognition as sr
 from typing import Final
-
-from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
 
-WHISPER_MODEL_NAME: Final[str] = os.getenv("WHISPER_MODEL", "tiny")
 MIN_AUDIO_BYTES: Final[int] = int(os.getenv("MIN_AUDIO_BYTES", "1500"))
 
 _HALLUCINATION_PATTERNS: Final[list[str]] = [
@@ -27,26 +26,14 @@ _HALLUCINATION_PATTERNS: Final[list[str]] = [
 ]
 _HALLUCINATION_REGEXES = [re.compile(p, re.IGNORECASE) for p in _HALLUCINATION_PATTERNS]
 
-# ─── Singleton ────────────────────────────────────────────────────────────────
-_model: WhisperModel | None = None
-
-
-def _get_model() -> WhisperModel:
-    global _model
-    if _model is None:
-        logger.info("[Whisper] Cargando modelo '%s' (faster-whisper)...", WHISPER_MODEL_NAME)
-        _model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
-        logger.info("[Whisper] Modelo '%s' listo.", WHISPER_MODEL_NAME)
-    return _model
-
+_recognizer = sr.Recognizer()
 
 def is_model_loaded() -> bool:
-    return _model is not None
-
+    # Siempre "cargado" porque usa API web
+    return True
 
 def _is_audio_too_short(audio_bytes: bytes) -> bool:
     return len(audio_bytes) < MIN_AUDIO_BYTES
-
 
 def _contains_real_content(text: str) -> bool:
     real_words = re.findall(r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF0-9]{2,}", text)
@@ -54,14 +41,13 @@ def _contains_real_content(text: str) -> bool:
         return False
     for pattern in _HALLUCINATION_REGEXES:
         if pattern.search(text):
-            logger.debug("[Whisper] Alucinación filtrada: %r", text[:80])
+            logger.debug("[STT] Alucinación filtrada: %r", text[:80])
             return False
     return True
 
-
 def transcribe(audio_bytes: bytes, source_lang: str = "es") -> str:
     """
-    Transcribe bytes de audio a texto usando faster-whisper.
+    Transcribe bytes de audio a texto usando Google Web Speech API.
     Returns: texto transcrito.
     Raises: ValueError si no hay audio válido.
     """
@@ -70,42 +56,40 @@ def transcribe(audio_bytes: bytes, source_lang: str = "es") -> str:
             f"Audio demasiado corto ({len(audio_bytes)} bytes < {MIN_AUDIO_BYTES} mínimo)."
         )
 
-    model = _get_model()
     tmp_path: str | None = None
 
     try:
-        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_file:
+        # Guardamos como wav (la app manda WAV aunque se llame .webm)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
             tmp_file.write(audio_bytes)
             tmp_path = tmp_file.name
 
-        logger.debug("[Whisper] Transcribiendo %d bytes (lang=%s)...", len(audio_bytes), source_lang)
+        logger.debug("[STT] Transcribiendo %d bytes (lang=%s)...", len(audio_bytes), source_lang)
 
-        # faster-whisper: transcribe() devuelve (segments_generator, info)
-        segments, info = model.transcribe(
-            tmp_path,
-            language=source_lang if source_lang != "auto" else None,
-            temperature=0.0,
-            beam_size=1,
-            best_of=1,
-            no_speech_threshold=0.6,
-            log_prob_threshold=-1.0,
-            compression_ratio_threshold=2.4,
-            condition_on_previous_text=False,
-            task="transcribe",
-        )
+        # Mapear idioma origen a locale completo si es necesario
+        # SpeechRecognition usa códigos como "es-ES", "en-US"
+        lang_code = "es-ES" if source_lang.startswith("es") else "en-US"
 
-        # Consumir el generador de segmentos
-        text_parts = [seg.text for seg in segments]
-        text: str = " ".join(text_parts).strip()
-        logger.debug("[Whisper] Output: %r (lang=%s)", text, info.language)
+        with sr.AudioFile(tmp_path) as source:
+            audio_data = _recognizer.record(source)
+
+        try:
+            text = _recognizer.recognize_google(audio_data, language=lang_code)
+            text = text.strip()
+        except sr.UnknownValueError:
+            raise ValueError("No se reconoció voz en el audio.")
+        except sr.RequestError as e:
+            raise RuntimeError(f"Error con el servicio STT: {e}")
+
+        logger.debug("[STT] Output: %r", text)
 
         if not text:
-            raise ValueError("Whisper no produjo texto (silencio o audio sin voz).")
+            raise ValueError("El servicio no produjo texto (silencio o audio sin voz).")
 
         if not _contains_real_content(text):
             raise ValueError(f"Texto descartado (posible alucinación): {text!r}")
 
-        logger.info("[Whisper] OK: %r", text)
+        logger.info("[STT] OK: %r", text)
         return text
 
     finally:
@@ -113,4 +97,4 @@ def transcribe(audio_bytes: bytes, source_lang: str = "es") -> str:
             try:
                 os.unlink(tmp_path)
             except OSError as e:
-                logger.warning("[Whisper] No se pudo borrar tempfile: %s", e)
+                logger.warning("[STT] No se pudo borrar tempfile: %s", e)
