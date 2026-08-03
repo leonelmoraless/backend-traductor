@@ -83,50 +83,109 @@ async def handle_ws_session(websocket: WebSocket) -> None:
     # ── Loop de audio (meeting_chunk) ─────────────────────────────────────────
     async def audio_loop():
         nonlocal src_lang, tgt_lang
+        import struct
+        import math
+        import io
+        import wave
+
+        def get_rms(pcm_data: bytes) -> float:
+            fmt = f"<{len(pcm_data) // 2}h"
+            try:
+                samples = struct.unpack(fmt, pcm_data)
+                sum_squares = sum(s * s for s in samples)
+                return math.sqrt(sum_squares / max(1, len(samples)))
+            except Exception:
+                return 0.0
+
+        def build_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, bit_depth: int = 16) -> bytes:
+            with io.BytesIO() as wav_io:
+                with wave.open(wav_io, 'wb') as wav_file:
+                    wav_file.setnchannels(channels)
+                    wav_file.setsampwidth(bit_depth // 8)
+                    wav_file.setframerate(sample_rate)
+                    wav_file.writeframes(pcm_data)
+                return wav_io.getvalue()
+
+        accumulated_pcm = bytearray()
+        silence_chunks = 0
+        is_speaking = False
+        SILENCE_THRESHOLD_RMS = 150.0  # Umbral de silencio
+        MAX_SILENCE_CHUNKS = 2  # 1.0 segundos de silencio (0.5s x 2)
+        MAX_PCM_LEN = 16000 * 2 * 10  # 10 segundos máximo
+
         while not closed[0]:
             try:
-                audio_bytes = await chunk_queue.get()
+                # Cada chunk es 0.5s (16000 bytes) de PCM crudo (sin header)
+                pcm_chunk = await chunk_queue.get()
                 if closed[0]:
                     break
 
-                # 1. Transcripción
-                text = await _run_in_thread(transcribe, audio_bytes, src_lang, timeout=25.0)
-                logger.info("[Meeting] Transcripción: %r", text)
+                rms = get_rms(pcm_chunk)
+                logger.debug("[VAD] RMS chunk: %.2f", rms)
 
-                if not _is_meaningful_text(text):
-                    continue
+                if rms > SILENCE_THRESHOLD_RMS:
+                    is_speaking = True
+                    silence_chunks = 0
+                else:
+                    if is_speaking:
+                        silence_chunks += 1
 
-                # 2. Detección de idioma
-                try:
-                    detected = langdetect.detect(text)
-                except Exception:
-                    detected = src_lang
+                accumulated_pcm.extend(pcm_chunk)
 
-                # Determinar dirección de traducción
-                actual_tgt = tgt_lang
-                if detected.startswith(tgt_lang) or detected == tgt_lang:
-                    actual_tgt = src_lang
+                trigger_transcription = False
+                if is_speaking and silence_chunks >= MAX_SILENCE_CHUNKS:
+                    trigger_transcription = True
+                elif len(accumulated_pcm) >= MAX_PCM_LEN:
+                    trigger_transcription = True
 
-                # 3. Traducción
-                translation = await _run_in_thread(
-                    translate, text, detected, actual_tgt, timeout=_TRANSLATE_TIMEOUT
-                )
-                logger.info("[Meeting] Traducción: %r", translation)
+                # Al menos 1 segundo de audio (32000 bytes) para evitar transcripciones inútiles cortas
+                if trigger_transcription and len(accumulated_pcm) > 32000:
+                    pcm_to_process = bytes(accumulated_pcm)
+                    # Reiniciar estado para la siguiente frase
+                    accumulated_pcm.clear()
+                    is_speaking = False
+                    silence_chunks = 0
 
-                # 4. Síntesis TTS
-                audio_b64 = await _run_in_thread(
-                    synthesize, translation, actual_tgt, timeout=_TTS_TIMEOUT
-                )
+                    wav_bytes = build_wav(pcm_to_process)
+                    
+                    # 1. Transcripción
+                    text = await _run_in_thread(transcribe, wav_bytes, src_lang, timeout=25.0)
+                    logger.info("[Meeting] Transcripción: %r", text)
 
-                # 5. Enviar resultado
-                await _safe_send(websocket, {
-                    "type":          "meeting_result",
-                    "transcripcion": text,
-                    "traduccion":    translation,
-                    "source_lang":   detected,
-                    "target_lang":   actual_tgt,
-                    "audio_base64":  audio_b64,
-                })
+                    if not _is_meaningful_text(text):
+                        continue
+
+                    # 2. Detección de idioma
+                    try:
+                        detected = langdetect.detect(text)
+                    except Exception:
+                        detected = src_lang
+
+                    # Determinar dirección de traducción
+                    actual_tgt = tgt_lang
+                    if detected.startswith(tgt_lang) or detected == tgt_lang:
+                        actual_tgt = src_lang
+
+                    # 3. Traducción
+                    translation = await _run_in_thread(
+                        translate, text, detected, actual_tgt, timeout=_TRANSLATE_TIMEOUT
+                    )
+                    logger.info("[Meeting] Traducción: %r", translation)
+
+                    # 4. Síntesis TTS
+                    audio_b64 = await _run_in_thread(
+                        synthesize, translation, actual_tgt, timeout=_TTS_TIMEOUT
+                    )
+
+                    # 5. Enviar resultado
+                    await _safe_send(websocket, {
+                        "type":          "meeting_result",
+                        "transcripcion": text,
+                        "traduccion":    translation,
+                        "source_lang":   detected,
+                        "target_lang":   actual_tgt,
+                        "audio_base64":  audio_b64,
+                    })
 
             except asyncio.TimeoutError:
                 logger.warning("[Meeting] Timeout procesando chunk de audio.")

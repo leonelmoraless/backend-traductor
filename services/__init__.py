@@ -1,2 +1,2 @@
-# Paquete de servicios del backend — exposición vacía para que Python
-# reconozca este directorio como módulo importable.
+﻿# Paquete de servicios del backend ÔÇö exposici├│n vac├¡a para que Python
+# reconozca este directorio como m├│dulo importable.
