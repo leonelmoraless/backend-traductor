@@ -73,6 +73,17 @@ def _is_meaningful_text(text: str) -> bool:
     return bool(_MEANINGFUL_TEXT_RE.search(text.strip()))
 
 
+def _word_similarity(a: str, b: str) -> float:
+    """Jaccard similarity a nivel de palabras para filtrar repeticiones."""
+    if not a or not b:
+        return 0.0
+    sa = set(a.lower().split())
+    sb = set(b.lower().split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
 async def _safe_send(websocket: WebSocket, payload: dict[str, Any]) -> bool:
     try:
         await websocket.send_json(payload)
@@ -218,6 +229,8 @@ async def handle_ws_session(websocket: WebSocket) -> None:
         Procesa batches de PCM en orden. Puede estar varios segundos en
         transcribir/traducir sin bloquear el VAD (que sigue acumulando en paralelo).
         """
+        last_text = ""   # Para deduplicación: evitar repetir la misma frase
+
         while not closed[0]:
             try:
                 pcm = await batch_queue.get()
@@ -238,6 +251,13 @@ async def handle_ws_session(websocket: WebSocket) -> None:
 
                 if not _is_meaningful_text(text):
                     continue
+
+                # Deduplicación: omitir si es >75% idéntica a la transcripción anterior
+                # (evita traducir repeticiones cuando el hablante repite palabras)
+                if _word_similarity(text, last_text) > 0.75:
+                    logger.debug("[Pipeline] Transcripción muy similar a la anterior, omitiendo: %r", text)
+                    continue
+                last_text = text
 
                 # 2. Detección de idioma
                 try:
