@@ -153,9 +153,9 @@ async def handle_ws_session(websocket: WebSocket) -> None:
         BYTES_PER_SAMPLE = 2
         BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE  # 32000
 
-        SILENCE_GATE_CHUNKS = 2       # 1s de silencio consecutivo = fin de frase
-        MAX_PHRASE_BYTES = BYTES_PER_SEC * 6   # 6s máximo (ampliado)
-        MIN_PHRASE_BYTES = BYTES_PER_SEC * 1   # 1s mínimo para procesar
+        SILENCE_GATE_CHUNKS = 1       # 0.5s de silencio consecutivo = fin de frase (RAPIDEZ)
+        MAX_PHRASE_BYTES = int(BYTES_PER_SEC * 3.5) # 3.5s máximo para no atrasar la traducción
+        MIN_PHRASE_BYTES = int(BYTES_PER_SEC * 0.8) # 0.8s mínimo para procesar (RAPIDEZ)
 
         # Adaptive Noise Floor Variables
         MIN_RMS = 50.0
