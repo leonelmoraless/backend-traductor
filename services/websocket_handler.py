@@ -74,7 +74,7 @@ async def handle_ws_session(websocket: WebSocket) -> None:
     src_lang = "es"
     tgt_lang = "en"
 
-    chunk_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=3)
+    chunk_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
     closed = [False]
 
     logger.info("[WS] Nueva sesión: %s", session_id)
@@ -111,7 +111,7 @@ async def handle_ws_session(websocket: WebSocket) -> None:
         is_speaking = False
         SILENCE_THRESHOLD_RMS = 150.0  # Umbral de silencio
         MAX_SILENCE_CHUNKS = 2  # 1.0 segundos de silencio (0.5s x 2)
-        MAX_PCM_LEN = 16000 * 2 * 10  # 10 segundos máximo
+        MAX_PCM_LEN = 16000 * 2 * 5  # 5 segundos máximo por frase
 
         while not closed[0]:
             try:
