@@ -1,22 +1,22 @@
 """
-Servicio de historial de conversaciones — Nuevo.
+Servicio de historial de conversaciones ÔÇö Nuevo.
 
-Responsabilidad: persistir y recuperar el historial de traducciones de cada sesión.
+Responsabilidad: persistir y recuperar el historial de traducciones de cada sesi├│n.
 
 Arquitectura:
-  · Caché en memoria (dict) para acceso O(1) durante la sesión activa.
-  · Persistencia en archivo JSONL (una línea JSON por entrada) para
+  ┬À Cach├® en memoria (dict) para acceso O(1) durante la sesi├│n activa.
+  ┬À Persistencia en archivo JSONL (una l├¡nea JSON por entrada) para
     sobrevivir reinicios del servidor.
-  · Cada entrada tiene: id, timestamp, session_id, source_lang, target_lang,
+  ┬À Cada entrada tiene: id, timestamp, session_id, source_lang, target_lang,
     transcripcion, traduccion.
-  · Endpoints disponibles vía main.py:
-      GET  /history                → todas las entradas (paginado)
-      GET  /history/{session_id}  → entradas de una sesión específica
-      DELETE /history             → limpia el historial completo
+  ┬À Endpoints disponibles v├¡a main.py:
+      GET  /history                ÔåÆ todas las entradas (paginado)
+      GET  /history/{session_id}  ÔåÆ entradas de una sesi├│n espec├¡fica
+      DELETE /history             ÔåÆ limpia el historial completo
 
-Diseño de concurrencia:
-  · asyncio.Lock para evitar escrituras simultáneas al archivo.
-  · La caché en memoria se actualiza sin lock (las lecturas de dict son thread-safe
+Dise├▒o de concurrencia:
+  ┬À asyncio.Lock para evitar escrituras simult├íneas al archivo.
+  ┬À La cach├® en memoria se actualiza sin lock (las lecturas de dict son thread-safe
     en CPython gracias al GIL).
 """
 
@@ -33,28 +33,28 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# ─── Configuración ────────────────────────────────────────────────────────────
+# ÔöÇÔöÇÔöÇ Configuraci├│n ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 _HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "conversation_history.jsonl"))
 _MAX_HISTORY_ENTRIES = int(os.getenv("MAX_HISTORY_ENTRIES", "500"))
 
-# ─── Estado interno ──────────────────────────────────────────────────────────
-# Lista maestra de todas las entradas (más reciente al final)
+# ÔöÇÔöÇÔöÇ Estado interno ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# Lista maestra de todas las entradas (m├ís reciente al final)
 _entries: list[dict[str, Any]] = []
-# Índice por session_id para acceso O(1) por sesión
+# ├ìndice por session_id para acceso O(1) por sesi├│n
 _by_session: dict[str, list[dict[str, Any]]] = {}
 # Lock para escrituras al archivo JSONL
 _file_lock = asyncio.Lock()
 _initialized = False
 
 
-# ─── Inicialización ───────────────────────────────────────────────────────────
+# ÔöÇÔöÇÔöÇ Inicializaci├│n ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
 def _load_history_sync() -> None:
     """Carga el historial desde disco al arrancar. Solo se llama una vez."""
     global _entries, _by_session, _initialized
 
     if not _HISTORY_FILE.exists():
-        logger.info("[History] Archivo de historial no encontrado. Comenzando con historial vacío.")
+        logger.info("[History] Archivo de historial no encontrado. Comenzando con historial vac├¡o.")
         _initialized = True
         return
 
@@ -73,13 +73,13 @@ def _load_history_sync() -> None:
                 loaded += 1
             except json.JSONDecodeError:
                 errors += 1
-                logger.warning("[History] Línea corrupta ignorada en historial.")
+                logger.warning("[History] L├¡nea corrupta ignorada en historial.")
 
-    # Mantener solo las últimas N entradas
+    # Mantener solo las ├║ltimas N entradas
     if len(_entries) > _MAX_HISTORY_ENTRIES:
         excess = len(_entries) - _MAX_HISTORY_ENTRIES
         _entries = _entries[excess:]
-        # Reconstruir índice por sesión
+        # Reconstruir ├¡ndice por sesi├│n
         _by_session.clear()
         for entry in _entries:
             sid = entry.get("session_id", "unknown")
@@ -93,12 +93,12 @@ def _load_history_sync() -> None:
 
 
 def ensure_initialized() -> None:
-    """Garantiza que el historial está cargado. Idempotente."""
+    """Garantiza que el historial est├í cargado. Idempotente."""
     if not _initialized:
         _load_history_sync()
 
 
-# ─── API pública ──────────────────────────────────────────────────────────────
+# ÔöÇÔöÇÔöÇ API p├║blica ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
 async def add_entry(
     session_id: str,
@@ -108,12 +108,12 @@ async def add_entry(
     traduccion: str,
 ) -> dict[str, Any]:
     """
-    Añade una nueva entrada al historial (memoria + disco).
+    A├▒ade una nueva entrada al historial (memoria + disco).
 
     Args:
-        session_id:   Identificador único de la sesión WebSocket.
-        source_lang:  Código ISO 639-1 del idioma origen.
-        target_lang:  Código ISO 639-1 del idioma destino.
+        session_id:   Identificador ├║nico de la sesi├│n WebSocket.
+        source_lang:  C├│digo ISO 639-1 del idioma origen.
+        target_lang:  C├│digo ISO 639-1 del idioma destino.
         transcripcion: Texto original transcrito.
         traduccion:   Texto traducido.
 
@@ -132,18 +132,18 @@ async def add_entry(
         "traduccion": traduccion,
     }
 
-    # Actualizar caché en memoria
+    # Actualizar cach├® en memoria
     _entries.append(entry)
     _by_session.setdefault(session_id, []).append(entry)
 
-    # Rotar si superamos el máximo
+    # Rotar si superamos el m├íximo
     if len(_entries) > _MAX_HISTORY_ENTRIES:
         oldest = _entries.pop(0)
         old_sid = oldest.get("session_id", "unknown")
         if old_sid in _by_session and oldest in _by_session[old_sid]:
             _by_session[old_sid].remove(oldest)
 
-    # Persistir en disco de forma asíncrona y segura
+    # Persistir en disco de forma as├¡ncrona y segura
     async with _file_lock:
         try:
             with _HISTORY_FILE.open("a", encoding="utf-8") as f:
@@ -151,7 +151,7 @@ async def add_entry(
         except OSError as exc:
             logger.error("[History] No se pudo escribir al archivo de historial: %s", exc)
 
-    logger.debug("[History] Entrada añadida: session=%s, %r→%r", session_id, transcripcion[:40], traduccion[:40])
+    logger.debug("[History] Entrada a├▒adida: session=%s, %rÔåÆ%r", session_id, transcripcion[:40], traduccion[:40])
     return entry
 
 
@@ -164,9 +164,9 @@ def get_all(
     Devuelve el historial paginado, opcionalmente filtrado por session_id.
 
     Args:
-        page:       Página (1-indexed).
-        page_size:  Entradas por página (máx. 100).
-        session_id: Si se provee, filtra solo las entradas de esa sesión.
+        page:       P├ígina (1-indexed).
+        page_size:  Entradas por p├ígina (m├íx. 100).
+        session_id: Si se provee, filtra solo las entradas de esa sesi├│n.
 
     Returns:
         Dict con: items, total, page, page_size, pages.
@@ -178,7 +178,7 @@ def get_all(
 
     source = _by_session.get(session_id, []) if session_id else _entries
 
-    # Más reciente primero
+    # M├ís reciente primero
     sorted_entries = list(reversed(source))
     total = len(sorted_entries)
     start = (page - 1) * page_size
@@ -200,7 +200,7 @@ def get_sessions() -> list[dict[str, Any]]:
 
     Returns:
         Lista de dicts con: session_id, entries_count, first_seen, last_seen,
-        langs (set de pares origen→destino usados).
+        langs (set de pares origenÔåÆdestino usados).
     """
     ensure_initialized()
 
@@ -208,7 +208,7 @@ def get_sessions() -> list[dict[str, Any]]:
     for sid, entries in _by_session.items():
         if not entries:
             continue
-        langs = list({f"{e['source_lang']}→{e['target_lang']}" for e in entries})
+        langs = list({f"{e['source_lang']}ÔåÆ{e['target_lang']}" for e in entries})
         sessions.append({
             "session_id": sid,
             "entries_count": len(entries),
@@ -217,7 +217,7 @@ def get_sessions() -> list[dict[str, Any]]:
             "langs": langs,
         })
 
-    # Ordenar por actividad más reciente primero
+    # Ordenar por actividad m├ís reciente primero
     sessions.sort(key=lambda s: s["last_seen"], reverse=True)
     return sessions
 
@@ -227,7 +227,7 @@ async def clear_history() -> dict[str, int]:
     Elimina todo el historial (memoria + disco).
 
     Returns:
-        Dict con el número de entradas eliminadas.
+        Dict con el n├║mero de entradas eliminadas.
     """
     global _entries, _by_session
 
