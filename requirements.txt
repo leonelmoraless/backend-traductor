@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-SpeechRecognition==3.10.1
+SpeechRecognition==3.17.0
 deep-translator
 gTTS
 python-multipart
