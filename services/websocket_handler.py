@@ -3,15 +3,32 @@ WebSocket handler para traducción en tiempo real.
 Soporta dos modos:
   - meeting_chunk: audio raw del dispositivo (pantalla Audio)
   - text_utterance: texto ya transcrito (pantalla Inicio)
+
+Arquitectura de Audio (meeting_chunk):
+  ┌─────────────────────────────────────────────────────────┐
+  │  chunk_queue  →  [vad_task]  →  batch_queue  →  [pipeline_task]  │
+  └─────────────────────────────────────────────────────────┘
+  
+  vad_task:      Lee chunks de 0.5s, acumula PCM, detecta pausas/tiempo,
+                 empuja batches listos a batch_queue. NUNCA bloquea por
+                 transcripción — así siempre sigue escuchando.
+                 
+  pipeline_task: Consume batches uno a uno: transcribe → traduce → TTS →
+                 envía resultado al cliente. Si hay múltiples batches
+                 en la cola, los procesa en orden sin perder ninguno.
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import math
 import os
 import re
+import struct
 import uuid
+import wave
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -65,6 +82,32 @@ async def _safe_send(websocket: WebSocket, payload: dict[str, Any]) -> bool:
         return False
 
 
+# ─── VAD helpers (sin dependencias externas) ─────────────────────────────────
+
+def _get_rms(pcm_data: bytes) -> float:
+    """Calcula el nivel de energía RMS de PCM 16-bit mono."""
+    n = len(pcm_data) // 2
+    if n == 0:
+        return 0.0
+    try:
+        samples = struct.unpack(f"<{n}h", pcm_data[:n * 2])
+        return math.sqrt(sum(s * s for s in samples) / n)
+    except Exception:
+        return 0.0
+
+
+def _build_wav(pcm_data: bytes, sample_rate: int = 16000,
+               channels: int = 1, bit_depth: int = 16) -> bytes:
+    """Empaqueta PCM crudo en un archivo WAV en memoria."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(bit_depth // 8)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_data)
+    return buf.getvalue()
+
+
 # ─── Handler principal ────────────────────────────────────────────────────────
 
 async def handle_ws_session(websocket: WebSocket) -> None:
@@ -74,129 +117,174 @@ async def handle_ws_session(websocket: WebSocket) -> None:
     src_lang = "es"
     tgt_lang = "en"
 
-    chunk_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+    # chunk_queue: chunks raw de PCM de 0.5s enviados por el móvil
+    # batch_queue: bloques acumulados listos para transcribir (máx 5 en espera)
+    chunk_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=100)
+    batch_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=5)
     closed = [False]
 
     logger.info("[WS] Nueva sesión: %s", session_id)
     await _safe_send(websocket, {"type": "session_id", "session_id": session_id})
 
-    # ── Loop de audio (meeting_chunk) ─────────────────────────────────────────
-    async def audio_loop():
-        nonlocal src_lang, tgt_lang
-        import struct
-        import math
-        import io
-        import wave
+    # ── VAD Task: acumula PCM y detecta frases. NUNCA espera transcripción. ───
+    async def vad_task():
+        """
+        Lee chunks de 0.5s del chunk_queue y acumula PCM.
+        Dispara un batch cuando:
+          A) Detecta ≥ 1s de silencio tras voz (silence-gate)
+          B) Se han acumulado ≥ 4 segundos de audio (tiempo máximo)
+        
+        No bloquea — si el batch_queue está lleno, descarta el batch más
+        antiguo para no perder audio nuevo.
+        """
+        # Parámetros VAD
+        SAMPLE_RATE = 16000
+        BYTES_PER_SAMPLE = 2
+        CHUNK_BYTES = 16000           # 0.5s de PCM (16000 bytes)
+        BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE  # 32000
 
-        def get_rms(pcm_data: bytes) -> float:
-            fmt = f"<{len(pcm_data) // 2}h"
-            try:
-                samples = struct.unpack(fmt, pcm_data)
-                sum_squares = sum(s * s for s in samples)
-                return math.sqrt(sum_squares / max(1, len(samples)))
-            except Exception:
-                return 0.0
+        RMS_SPEECH_THRESHOLD = 200.0  # Por encima = habla
+        SILENCE_GATE_CHUNKS = 2       # 1s de silencio consecutivo = fin de frase
+        MAX_PHRASE_BYTES = BYTES_PER_SEC * 4   # 4s máximo antes de cortar
+        MIN_PHRASE_BYTES = BYTES_PER_SEC * 1   # 1s mínimo para procesar
 
-        def build_wav(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, bit_depth: int = 16) -> bytes:
-            with io.BytesIO() as wav_io:
-                with wave.open(wav_io, 'wb') as wav_file:
-                    wav_file.setnchannels(channels)
-                    wav_file.setsampwidth(bit_depth // 8)
-                    wav_file.setframerate(sample_rate)
-                    wav_file.writeframes(pcm_data)
-                return wav_io.getvalue()
-
-        accumulated_pcm = bytearray()
-        silence_chunks = 0
-        is_speaking = False
-        SILENCE_THRESHOLD_RMS = 150.0  # Umbral de silencio
-        MAX_SILENCE_CHUNKS = 2  # 1.0 segundos de silencio (0.5s x 2)
-        MAX_PCM_LEN = 16000 * 2 * 5  # 5 segundos máximo por frase
+        accumulated = bytearray()
+        silence_count = 0
+        speech_detected = False
 
         while not closed[0]:
             try:
-                # Cada chunk es 0.5s (16000 bytes) de PCM crudo (sin header)
-                pcm_chunk = await chunk_queue.get()
+                # Esperar hasta 0.8s por un nuevo chunk
+                try:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=0.8)
+                except asyncio.TimeoutError:
+                    # Timeout: si llevamos audio acumulado con voz y ya no llega
+                    # nada nuevo, procesar lo que tenemos (dispositivo en silencio)
+                    if speech_detected and len(accumulated) >= MIN_PHRASE_BYTES:
+                        await _push_batch(batch_queue, bytes(accumulated))
+                        accumulated.clear()
+                        speech_detected = False
+                        silence_count = 0
+                    continue
+
                 if closed[0]:
                     break
 
-                rms = get_rms(pcm_chunk)
-                logger.debug("[VAD] RMS chunk: %.2f", rms)
+                rms = _get_rms(chunk)
+                logger.debug("[VAD] RMS=%.1f | acc=%d bytes", rms, len(accumulated))
 
-                if rms > SILENCE_THRESHOLD_RMS:
-                    is_speaking = True
-                    silence_chunks = 0
+                if rms >= RMS_SPEECH_THRESHOLD:
+                    speech_detected = True
+                    silence_count = 0
                 else:
-                    if is_speaking:
-                        silence_chunks += 1
+                    if speech_detected:
+                        silence_count += 1
 
-                accumulated_pcm.extend(pcm_chunk)
+                accumulated.extend(chunk)
 
-                trigger_transcription = False
-                if is_speaking and silence_chunks >= MAX_SILENCE_CHUNKS:
-                    trigger_transcription = True
-                elif len(accumulated_pcm) >= MAX_PCM_LEN:
-                    trigger_transcription = True
+                # Trigger A: silencio tras voz
+                if speech_detected and silence_count >= SILENCE_GATE_CHUNKS:
+                    if len(accumulated) >= MIN_PHRASE_BYTES:
+                        await _push_batch(batch_queue, bytes(accumulated))
+                    accumulated.clear()
+                    speech_detected = False
+                    silence_count = 0
 
-                # Al menos 1 segundo de audio (32000 bytes) para evitar transcripciones inútiles cortas
-                if trigger_transcription and len(accumulated_pcm) > 32000:
-                    pcm_to_process = bytes(accumulated_pcm)
-                    # Reiniciar estado para la siguiente frase
-                    accumulated_pcm.clear()
-                    is_speaking = False
-                    silence_chunks = 0
+                # Trigger B: tiempo máximo
+                elif len(accumulated) >= MAX_PHRASE_BYTES:
+                    await _push_batch(batch_queue, bytes(accumulated))
+                    accumulated.clear()
+                    speech_detected = False
+                    silence_count = 0
 
-                    wav_bytes = build_wav(pcm_to_process)
-                    
-                    # 1. Transcripción
-                    text = await _run_in_thread(transcribe, wav_bytes, src_lang, timeout=25.0)
-                    logger.info("[Meeting] Transcripción: %r", text)
-
-                    if not _is_meaningful_text(text):
-                        continue
-
-                    # 2. Detección de idioma
-                    try:
-                        detected = langdetect.detect(text)
-                    except Exception:
-                        detected = src_lang
-
-                    # Determinar dirección de traducción
-                    actual_tgt = tgt_lang
-                    if detected.startswith(tgt_lang) or detected == tgt_lang:
-                        actual_tgt = src_lang
-
-                    # 3. Traducción
-                    translation = await _run_in_thread(
-                        translate, text, detected, actual_tgt, timeout=_TRANSLATE_TIMEOUT
-                    )
-                    logger.info("[Meeting] Traducción: %r", translation)
-
-                    # 4. Síntesis TTS
-                    audio_b64 = await _run_in_thread(
-                        synthesize, translation, actual_tgt, timeout=_TTS_TIMEOUT
-                    )
-
-                    # 5. Enviar resultado
-                    await _safe_send(websocket, {
-                        "type":          "meeting_result",
-                        "transcripcion": text,
-                        "traduccion":    translation,
-                        "source_lang":   detected,
-                        "target_lang":   actual_tgt,
-                        "audio_base64":  audio_b64,
-                    })
-
-            except asyncio.TimeoutError:
-                logger.warning("[Meeting] Timeout procesando chunk de audio.")
-            except ValueError as ve:
-                logger.debug("[Meeting] Chunk inválido: %s", ve)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("[Meeting] Error inesperado: %s", e)
+                logger.error("[VAD] Error: %s", e)
 
-    loop_task = asyncio.create_task(audio_loop())
+    async def _push_batch(q: asyncio.Queue, pcm: bytes) -> None:
+        """Empuja un batch al pipeline. Si está lleno, descarta el más antiguo."""
+        if q.full():
+            try:
+                q.get_nowait()
+                logger.debug("[VAD] batch_queue llena — descartando batch antiguo")
+            except asyncio.QueueEmpty:
+                pass
+        q.put_nowait(pcm)
+
+    # ── Pipeline Task: transcribe → traduce → TTS → envía al cliente ──────────
+    async def pipeline_task():
+        """
+        Procesa batches de PCM en orden. Puede estar varios segundos en
+        transcribir/traducir sin bloquear el VAD (que sigue acumulando en paralelo).
+        """
+        while not closed[0]:
+            try:
+                pcm = await batch_queue.get()
+                if closed[0]:
+                    break
+
+                wav = _build_wav(pcm)
+                current_src = src_lang
+                current_tgt = tgt_lang
+
+                # 1. Transcripción (blocking → thread pool)
+                try:
+                    text = await _run_in_thread(transcribe, wav, current_src, timeout=25.0)
+                    logger.info("[Pipeline] Transcripción: %r", text)
+                except Exception as e:
+                    logger.debug("[Pipeline] Sin texto: %s", e)
+                    continue
+
+                if not _is_meaningful_text(text):
+                    continue
+
+                # 2. Detección de idioma
+                try:
+                    detected = langdetect.detect(text)
+                except Exception:
+                    detected = current_src
+
+                actual_tgt = current_tgt
+                if detected == current_tgt or detected.startswith(current_tgt):
+                    actual_tgt = current_src
+
+                # 3. Traducción
+                try:
+                    translation = await _run_in_thread(
+                        translate, text, detected, actual_tgt, timeout=_TRANSLATE_TIMEOUT
+                    )
+                    logger.info("[Pipeline] Traducción: %r", translation)
+                except Exception as e:
+                    logger.warning("[Pipeline] Error traduciendo: %s", e)
+                    continue
+
+                # 4. Síntesis TTS
+                try:
+                    audio_b64 = await _run_in_thread(
+                        synthesize, translation, actual_tgt, timeout=_TTS_TIMEOUT
+                    )
+                except Exception as e:
+                    logger.warning("[Pipeline] Error TTS: %s", e)
+                    audio_b64 = ""
+
+                # 5. Enviar resultado
+                await _safe_send(websocket, {
+                    "type":          "meeting_result",
+                    "transcripcion": text,
+                    "traduccion":    translation,
+                    "source_lang":   detected,
+                    "target_lang":   actual_tgt,
+                    "audio_base64":  audio_b64,
+                })
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("[Pipeline] Error inesperado: %s", e)
+
+    vad = asyncio.create_task(vad_task())
+    pipeline = asyncio.create_task(pipeline_task())
 
     try:
         while True:
@@ -221,7 +309,7 @@ async def handle_ws_session(websocket: WebSocket) -> None:
                     continue
                 try:
                     audio_bytes = base64.b64decode(message["data"])
-                    # Si la cola está llena, descartamos el más antiguo
+                    # Cola circular: si llena, descartamos el chunk más antiguo
                     if chunk_queue.full():
                         try:
                             chunk_queue.get_nowait()
@@ -308,4 +396,5 @@ async def handle_ws_session(websocket: WebSocket) -> None:
         logger.error("[WS:%s] Error de sesión: %s", session_id, exc)
     finally:
         closed[0] = True
-        loop_task.cancel()
+        vad.cancel()
+        pipeline.cancel()
