@@ -1,6 +1,9 @@
 """
-Servicio de transcripción ultra-rápido para Render Free Tier.
-Utiliza SpeechRecognition (Google Web Speech API) para 0MB de overhead de RAM.
+Servicio de transcripción usando Google Web Speech API.
+
+Soporta todos los idiomas que Google Web Speech API acepta:
+  es → es-ES, en → en-US, fr → fr-FR, de → de-DE,
+  pt → pt-BR, it → it-IT, ja → ja-JP, ko → ko-KR, zh → zh-CN
 """
 
 from __future__ import annotations
@@ -16,6 +19,22 @@ logger = logging.getLogger(__name__)
 
 MIN_AUDIO_BYTES: Final[int] = int(os.getenv("MIN_AUDIO_BYTES", "1500"))
 
+# Mapeo completo: código de idioma → locale BCP-47 para Google Web Speech API
+# Todos estos idiomas son soportados por recognize_google()
+_LANG_TO_LOCALE: Final[dict[str, str]] = {
+    "es": "es-ES",
+    "en": "en-US",
+    "fr": "fr-FR",
+    "de": "de-DE",
+    "pt": "pt-BR",
+    "it": "it-IT",
+    "ja": "ja-JP",
+    "ko": "ko-KR",
+    "zh": "zh-CN",
+    "zh-cn": "zh-CN",
+    "zh-tw": "zh-TW",
+}
+
 _HALLUCINATION_PATTERNS: Final[list[str]] = [
     r"^\s*\.*\s*$",
     r"^[\s\.\,\!\?\-\_]+$",
@@ -28,15 +47,20 @@ _HALLUCINATION_REGEXES = [re.compile(p, re.IGNORECASE) for p in _HALLUCINATION_P
 
 _recognizer = sr.Recognizer()
 
-def is_model_loaded() -> bool:
-    # Siempre "cargado" porque usa API web
-    return True
 
-def _is_audio_too_short(audio_bytes: bytes) -> bool:
-    return len(audio_bytes) < MIN_AUDIO_BYTES
+def _resolve_locale(source_lang: str) -> str:
+    """Convierte código de idioma a locale BCP-47. Fallback a en-US si no se conoce."""
+    code = source_lang.lower().strip()
+    # Primero buscar coincidencia exacta, luego por prefijo
+    locale = _LANG_TO_LOCALE.get(code)
+    if not locale:
+        prefix = code.split("-")[0].split("_")[0]
+        locale = _LANG_TO_LOCALE.get(prefix, "en-US")
+    return locale
+
 
 def _contains_real_content(text: str) -> bool:
-    real_words = re.findall(r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF0-9]{2,}", text)
+    real_words = re.findall(r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF0-9]{2,}", text)
     if not real_words:
         return False
     for pattern in _HALLUCINATION_REGEXES:
@@ -45,43 +69,49 @@ def _contains_real_content(text: str) -> bool:
             return False
     return True
 
+
+def is_model_loaded() -> bool:
+    return True  # Siempre activo, usa API web
+
+
 def transcribe(audio_bytes: bytes, source_lang: str = "es") -> str:
     """
-    Transcribe bytes de audio a texto usando Google Web Speech API.
-    Returns: texto transcrito.
-    Raises: ValueError si no hay audio válido.
+    Transcribe bytes de audio WAV a texto usando Google Web Speech API.
+
+    Args:
+        audio_bytes: Bytes del archivo WAV a transcribir.
+        source_lang:  Código de idioma (es, en, fr, de, pt, it, ja, ko, zh, etc.)
+
+    Returns:
+        Texto transcrito (no vacío).
+
+    Raises:
+        ValueError:   Si el audio es demasiado corto, silencioso, o produce alucinaciones.
+        RuntimeError: Si el servicio STT falla.
     """
-    if _is_audio_too_short(audio_bytes):
+    if len(audio_bytes) < MIN_AUDIO_BYTES:
         raise ValueError(
             f"Audio demasiado corto ({len(audio_bytes)} bytes < {MIN_AUDIO_BYTES} mínimo)."
         )
 
-    tmp_path: str | None = None
+    locale = _resolve_locale(source_lang)
+    logger.debug("[STT] Transcribiendo %d bytes (lang=%s → locale=%s)…", len(audio_bytes), source_lang, locale)
 
+    tmp_path: str | None = None
     try:
-        # Guardamos como wav (la app manda WAV aunque se llame .webm)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
             tmp_file.write(audio_bytes)
             tmp_path = tmp_file.name
-
-        logger.debug("[STT] Transcribiendo %d bytes (lang=%s)...", len(audio_bytes), source_lang)
-
-        # Mapear idioma origen a locale completo si es necesario
-        # SpeechRecognition usa códigos como "es-ES", "en-US"
-        lang_code = "es-ES" if source_lang.startswith("es") else "en-US"
 
         with sr.AudioFile(tmp_path) as source:
             audio_data = _recognizer.record(source)
 
         try:
-            text = _recognizer.recognize_google(audio_data, language=lang_code)
-            text = text.strip()
+            text = _recognizer.recognize_google(audio_data, language=locale).strip()
         except sr.UnknownValueError:
             raise ValueError("No se reconoció voz en el audio.")
         except sr.RequestError as e:
             raise RuntimeError(f"Error con el servicio STT: {e}")
-
-        logger.debug("[STT] Output: %r", text)
 
         if not text:
             raise ValueError("El servicio no produjo texto (silencio o audio sin voz).")
@@ -89,7 +119,7 @@ def transcribe(audio_bytes: bytes, source_lang: str = "es") -> str:
         if not _contains_real_content(text):
             raise ValueError(f"Texto descartado (posible alucinación): {text!r}")
 
-        logger.info("[STT] OK: %r", text)
+        logger.info("[STT] OK (locale=%s): %r", locale, text)
         return text
 
     finally:
