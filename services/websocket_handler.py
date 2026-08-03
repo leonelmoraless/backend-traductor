@@ -148,16 +148,19 @@ async def handle_ws_session(websocket: WebSocket) -> None:
         No bloquea — si el batch_queue está lleno, descarta el batch más
         antiguo para no perder audio nuevo.
         """
-        # Parámetros VAD
+        # Parámetros VAD Adaptativo (Mejorado para ruido de fondo/música)
         SAMPLE_RATE = 16000
         BYTES_PER_SAMPLE = 2
-        CHUNK_BYTES = 16000           # 0.5s de PCM (16000 bytes)
         BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE  # 32000
 
-        RMS_SPEECH_THRESHOLD = 200.0  # Por encima = habla
         SILENCE_GATE_CHUNKS = 2       # 1s de silencio consecutivo = fin de frase
-        MAX_PHRASE_BYTES = BYTES_PER_SEC * 4   # 4s máximo antes de cortar
+        MAX_PHRASE_BYTES = BYTES_PER_SEC * 6   # 6s máximo (ampliado)
         MIN_PHRASE_BYTES = BYTES_PER_SEC * 1   # 1s mínimo para procesar
+
+        # Adaptive Noise Floor Variables
+        MIN_RMS = 50.0
+        noise_floor = 500.0
+        ALPHA = 0.95
 
         accumulated = bytearray()
         silence_count = 0
@@ -169,8 +172,6 @@ async def handle_ws_session(websocket: WebSocket) -> None:
                 try:
                     chunk = await asyncio.wait_for(chunk_queue.get(), timeout=0.8)
                 except asyncio.TimeoutError:
-                    # Timeout: si llevamos audio acumulado con voz y ya no llega
-                    # nada nuevo, procesar lo que tenemos (dispositivo en silencio)
                     if speech_detected and len(accumulated) >= MIN_PHRASE_BYTES:
                         await _push_batch(batch_queue, bytes(accumulated))
                         accumulated.clear()
@@ -182,9 +183,16 @@ async def handle_ws_session(websocket: WebSocket) -> None:
                     break
 
                 rms = _get_rms(chunk)
-                logger.debug("[VAD] RMS=%.1f | acc=%d bytes", rms, len(accumulated))
+                
+                # Dynamic Threshold Logic
+                if rms < noise_floor * 1.5:
+                    noise_floor = (ALPHA * noise_floor) + ((1.0 - ALPHA) * max(MIN_RMS, rms))
+                
+                threshold = (noise_floor * 1.8) + 150.0
 
-                if rms >= RMS_SPEECH_THRESHOLD:
+                logger.debug("[VAD] RMS=%.1f | Floor=%.1f | Thr=%.1f | acc=%d", rms, noise_floor, threshold, len(accumulated))
+
+                if rms >= threshold:
                     speech_detected = True
                     silence_count = 0
                 else:
