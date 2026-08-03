@@ -1,4 +1,5 @@
 """
+<<<<<<< HEAD
 WebSocket handler para sesión de traducción bidireccional (Streaming).
 """
 
@@ -6,12 +7,52 @@ import asyncio
 import base64
 import re
 from concurrent.futures import ThreadPoolExecutor
+=======
+WebSocket handler para traducción en tiempo real — Producción-ready v2.
+
+FIXES v2:
+  · CRÍTICO: asyncio.get_event_loop() → asyncio.get_running_loop()
+    get_event_loop() está deprecado en Python 3.10+ desde un coroutine y puede
+    levantar DeprecationWarning o fallar según configuración del event loop.
+
+  · CRÍTICO: asyncio.CancelledError no era capturado en el bloque interior.
+    CancelledError es BaseException (no Exception), así que escapaba del
+    'except Exception' y mataba la sesión WebSocket entera sin notificar al cliente.
+    Ahora se captura explícitamente y se envía mensaje de error al cliente.
+
+  · CRÍTICO: _is_meaningful_text compilaba el regex en CADA llamada.
+    Ahora el pattern es una constante a nivel de módulo.
+
+  · asyncio.wait_for timeout separado por operación:
+    - Traducción: _TRANSLATE_TIMEOUT (10s)
+    - TTS:        _TTS_TIMEOUT (12s)
+    - Cada servicio ya tiene timeouts de red propios, esto es la última barrera.
+
+  · Añadido mensaje "processing" inmediatamente al recibir utterance,
+    antes de cualquier operación async. El cliente sabe que el servidor
+    recibió el texto.
+
+  · _run_in_thread ahora usa asyncio.get_running_loop() correctamente.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+import langdetect
+>>>>>>> 1dbc4a9 (Update for langdetect)
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from services.transcription import transcribe
 from services.translation import translate
 from services.tts import synthesize
+<<<<<<< HEAD
 
 _executor = ThreadPoolExecutor(max_workers=5)
 
@@ -292,3 +333,228 @@ async def _process_text_final(
         except Exception as exc:
             print(f"[WS Final Text] Error: {exc}")
             await _safe_send(websocket, {"type": "error", "message": "Error procesando la traducción o el audio final."}, closed)
+=======
+from services import history as history_service
+
+logger = logging.getLogger(__name__)
+
+# ─── Configuración ────────────────────────────────────────────────────────────
+_WORKERS = int(os.getenv("WS_WORKERS", str((os.cpu_count() or 2) * 2)))
+# Timeouts separados por operación (últimas barreras de seguridad)
+# Los servicios ya tienen timeouts internos (socket/HTTP), estos son el fallback.
+_TRANSLATE_TIMEOUT = float(os.getenv("WS_TRANSLATE_TIMEOUT_SEC", "12.0"))
+_TTS_TIMEOUT = float(os.getenv("WS_TTS_TIMEOUT_SEC", "15.0"))
+
+# Pool de threads para operaciones síncronas bloqueantes
+_executor = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="translator")
+
+# Regex compilado UNA SOLA VEZ (no en cada llamada)
+_MEANINGFUL_TEXT_RE = re.compile(
+    r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\u0600-\u06FF]{2,}"
+)
+
+logger.info("[WS] ThreadPoolExecutor: %d workers. Translate timeout: %.0fs, TTS timeout: %.0fs",
+            _WORKERS, _TRANSLATE_TIMEOUT, _TTS_TIMEOUT)
+
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async def _run_in_thread(fn, *args, timeout: float) -> Any:
+    """
+    Ejecuta una función síncrona en el pool de threads con timeout.
+
+    Usa asyncio.get_running_loop() (correcto para Python 3.10+).
+    El timeout es la ÚLTIMA barrera de seguridad. Los servicios internos
+    (translation, tts) ya tienen sus propios timeouts HTTP/socket.
+
+    Raises:
+        asyncio.TimeoutError: Si la operación supera el timeout.
+        asyncio.CancelledError: Si la tarea fue cancelada externamente.
+    """
+    loop = asyncio.get_running_loop()  # FIX: era get_event_loop() (deprecado)
+    future = loop.run_in_executor(_executor, fn, *args)
+    return await asyncio.wait_for(future, timeout=timeout)
+
+
+def _is_meaningful_text(text: str) -> bool:
+    """
+    Verifica que el texto tiene contenido semántico útil.
+    El regex se compiló una vez al cargar el módulo (no se recompila aquí).
+    """
+    return bool(_MEANINGFUL_TEXT_RE.search(text.strip()))
+
+
+async def _safe_send(websocket: WebSocket, payload: dict[str, Any]) -> bool:
+    """Envía JSON al cliente de forma segura. Devuelve False si la conexión está cerrada."""
+    try:
+        await websocket.send_json(payload)
+        return True
+    except Exception as exc:
+        logger.debug("[WS] send fallido (conexión cerrada?): %s", exc)
+        return False
+
+
+# ─── Handler principal ────────────────────────────────────────────────────────
+
+async def handle_ws_session(websocket: WebSocket) -> None:
+    """
+    Gestiona una sesión completa de traducción en tiempo real.
+
+    Pipeline por utterance:
+      receive text_utterance
+        → filtro de contenido
+        → [translate] con timeout _TRANSLATE_TIMEOUT
+        → [synthesize] con timeout _TTS_TIMEOUT
+        → guardar historial
+        → enviar translation_result al cliente
+    """
+    await websocket.accept()
+
+    session_id = str(uuid.uuid4())
+    source_lang = "es"
+    target_lang = "en"
+
+    logger.info("[WS] Nueva sesión: %s", session_id)
+    await _safe_send(websocket, {"type": "session_id", "session_id": session_id})
+
+    try:
+        while True:
+            # receive_json puede lanzar WebSocketDisconnect si el cliente se va
+            message = await websocket.receive_json()
+            msg_type = message.get("type", "")
+
+            # ── Config ──────────────────────────────────────────────────────
+            if msg_type == "config":
+                source_lang = message.get("source_lang", source_lang)
+                target_lang = message.get("target_lang", target_lang)
+                logger.info("[WS:%s] Config: %s → %s", session_id, source_lang, target_lang)
+                await _safe_send(websocket, {
+                    "type": "config_ack",
+                    "source_lang": source_lang,
+                    "target_lang": target_lang,
+                    "session_id": session_id,
+                })
+
+            # ── Utterance (texto a traducir) ─────────────────────────────────
+            elif msg_type == "text_utterance":
+                transcripcion = message.get("text", "").strip()
+
+                if not _is_meaningful_text(transcripcion):
+                    logger.debug("[WS:%s] Texto sin contenido útil: %r", session_id, transcripcion)
+                    await _safe_send(websocket, {
+                        "type": "no_speech",
+                        "message": "No se detectó contenido útil en el texto.",
+                    })
+                    continue
+
+                logger.info("[WS:%s] Utterance recibida: %r", session_id, transcripcion[:80])
+
+                # Avisar al cliente de inmediato que estamos procesando
+                await _safe_send(websocket, {"type": "processing"})
+
+                try:
+                    # ── 1. Traducción (Con Auto-Detección) ───────────────────
+                    await _safe_send(websocket, {"type": "translating"})
+                    
+                    try:
+                        detected_lang = langdetect.detect(transcripcion)
+                    except langdetect.LangDetectException:
+                        detected_lang = source_lang # Fallback
+                        
+                    # Si el idioma detectado se parece más al target, invertimos
+                    if detected_lang.startswith(target_lang) or detected_lang == target_lang:
+                        actual_source = target_lang
+                        actual_target = source_lang
+                    else:
+                        actual_source = source_lang
+                        actual_target = target_lang
+
+                    traduccion = await _run_in_thread(
+                        translate, transcripcion, actual_source, actual_target,
+                        timeout=_TRANSLATE_TIMEOUT,
+                    )
+                    logger.info("[WS:%s] Traducción OK: %r", session_id, traduccion[:80])
+
+                    # ── 2. Síntesis de voz ───────────────────────────────────
+                    await _safe_send(websocket, {"type": "synthesizing"})
+                    audio_b64 = await _run_in_thread(
+                        synthesize, traduccion, actual_target,
+                        timeout=_TTS_TIMEOUT,
+                    )
+
+                    # ── 3. Guardar en historial ──────────────────────────────
+                    entry = await history_service.add_entry(
+                        session_id=session_id,
+                        source_lang=actual_source,
+                        target_lang=actual_target,
+                        transcripcion=transcripcion,
+                        traduccion=traduccion,
+                    )
+
+                    # ── 4. Resultado al cliente ──────────────────────────────
+                    await _safe_send(websocket, {
+                        "type":          "translation_result",
+                        "transcripcion": transcripcion,
+                        "traduccion":    traduccion,
+                        "audio_base64":  audio_b64,
+                        "entry_id":      entry["id"],
+                        "detected_lang": actual_source,
+                    })
+                    logger.info("[WS:%s] Resultado enviado OK. entry_id=%s", session_id, entry["id"])
+
+                except asyncio.TimeoutError:
+                    # El servicio (translate o TTS) superó su timeout de asyncio
+                    logger.error("[WS:%s] Timeout de operación.", session_id)
+                    await _safe_send(websocket, {
+                        "type": "error",
+                        "message": "Tiempo de espera agotado. Intenta de nuevo.",
+                    })
+
+                except asyncio.CancelledError:
+                    # FIX CRÍTICO: CancelledError es BaseException, no Exception.
+                    # Sin este bloque, propagaba y mataba la sesión WebSocket.
+                    logger.warning("[WS:%s] Tarea cancelada durante procesamiento.", session_id)
+                    await _safe_send(websocket, {
+                        "type": "error",
+                        "message": "Procesamiento interrumpido. Intenta de nuevo.",
+                    })
+                    # Re-raise para que el event loop sepa que fue cancelado
+                    raise
+
+                except ValueError as ve:
+                    # Errores de validación (texto vacío, audio sin voz, etc.)
+                    logger.warning("[WS:%s] Error de validación: %s", session_id, ve)
+                    await _safe_send(websocket, {
+                        "type": "no_speech",
+                        "message": str(ve),
+                    })
+
+                except RuntimeError as re_exc:
+                    # Errores de servicio externo (API de traducción, TTS) tras reintentos
+                    logger.error("[WS:%s] Error de servicio: %s", session_id, re_exc)
+                    await _safe_send(websocket, {
+                        "type": "error",
+                        "message": f"Servicio temporalmente no disponible. Intenta de nuevo.",
+                    })
+
+                except Exception as exc:
+                    logger.error("[WS:%s] Error inesperado: %s", session_id, exc, exc_info=True)
+                    await _safe_send(websocket, {
+                        "type": "error",
+                        "message": "Error interno. Intenta de nuevo.",
+                    })
+
+            # ── Tipo desconocido ─────────────────────────────────────────────
+            else:
+                logger.debug("[WS:%s] Mensaje desconocido: %r", session_id, msg_type)
+
+    except WebSocketDisconnect:
+        logger.info("[WS:%s] Cliente desconectado.", session_id)
+
+    except asyncio.CancelledError:
+        logger.info("[WS:%s] Sesión cancelada por el servidor.", session_id)
+
+    except Exception as exc:
+        logger.error("[WS:%s] Error fatal en sesión: %s", session_id, exc, exc_info=True)
+        await _safe_send(websocket, {"type": "error", "message": "Error interno del servidor."})
+>>>>>>> 1dbc4a9 (Update for langdetect)
