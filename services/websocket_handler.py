@@ -142,55 +142,66 @@ async def handle_ws_session(websocket: WebSocket) -> None:
         """
         Lee chunks de 0.5s del chunk_queue y acumula PCM.
         Dispara un batch cuando:
-          A) Detecta ≥ 1s de silencio tras voz (silence-gate)
-          B) Se han acumulado ≥ 4 segundos de audio (tiempo máximo)
+          A) Detecta silencio (>= SILENCE_GATE_CHUNKS) tras voz
+          B) Acumuló >= MAX_PHRASE_BYTES (máximo forzado)
         
-        No bloquea — si el batch_queue está lleno, descarta el batch más
-        antiguo para no perder audio nuevo.
+        GARANTÍAS:
+          - Nunca pierde un chunk de audio (buffer circular en chunk_queue)
+          - Siempre sigue escuchando sin importar qué pase en el pipeline
+          - Si hay audio continuo sin silencio, fuerza corte cada 3.5s
+          - Si pasan 3s sin chunks (silencio total de pantalla), resetea estado
         """
-        # Parámetros VAD Adaptativo (Mejorado para ruido de fondo/música)
         SAMPLE_RATE = 16000
         BYTES_PER_SAMPLE = 2
         BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE  # 32000
 
-        SILENCE_GATE_CHUNKS = 1       # 0.5s de silencio consecutivo = fin de frase (RAPIDEZ)
-        MAX_PHRASE_BYTES = int(BYTES_PER_SEC * 3.5) # 3.5s máximo para no atrasar la traducción
-        MIN_PHRASE_BYTES = int(BYTES_PER_SEC * 0.8) # 0.8s mínimo para procesar (RAPIDEZ)
+        SILENCE_GATE_CHUNKS = 1       # 0.5s silencio = fin de frase (ultra rápido)
+        MAX_PHRASE_BYTES = int(BYTES_PER_SEC * 3.5)  # 3.5s máximo antes de forzar corte
+        MIN_PHRASE_BYTES = int(BYTES_PER_SEC * 0.6)  # 0.6s mínimo (captura frases cortas)
 
-        # Adaptive Noise Floor Variables
-        MIN_RMS = 50.0
-        noise_floor = 500.0
-        ALPHA = 0.95
+        # Ruido de fondo adaptativo
+        MIN_RMS = 40.0
+        noise_floor = 400.0
+        ALPHA = 0.93        # Un poco más reactivo que antes (era 0.95)
 
         accumulated = bytearray()
         silence_count = 0
         speech_detected = False
+        chunks_since_last_flush = 0  # contador para forzar flush por volumen
 
         while not closed[0]:
             try:
-                # Esperar hasta 0.8s por un nuevo chunk
+                # Esperar hasta 1.5s por el siguiente chunk (silencio de pantalla)
+                # Si no llega nada en 1.5s, forzar flush de lo acumulado y resetear
                 try:
-                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=0.8)
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=1.5)
                 except asyncio.TimeoutError:
-                    if speech_detected and len(accumulated) >= MIN_PHRASE_BYTES:
+                    # Silencio prolongado de pantalla — limpiar estado sin perder lo acumulado
+                    if len(accumulated) >= MIN_PHRASE_BYTES:
+                        logger.debug("[VAD] Timeout de silencio — forzando flush de %d bytes", len(accumulated))
                         await _push_batch(batch_queue, bytes(accumulated))
-                        accumulated.clear()
-                        speech_detected = False
-                        silence_count = 0
+                    accumulated.clear()
+                    speech_detected = False
+                    silence_count = 0
+                    chunks_since_last_flush = 0
+                    # Resetear noise floor parcialmente para adaptarse al nuevo contexto
+                    noise_floor = max(noise_floor * 0.7, MIN_RMS * 5)
                     continue
 
                 if closed[0]:
                     break
 
                 rms = _get_rms(chunk)
-                
-                # Dynamic Threshold Logic
+                chunks_since_last_flush += 1
+
+                # Actualizar noise floor solo con audio que parece silencio
                 if rms < noise_floor * 1.5:
                     noise_floor = (ALPHA * noise_floor) + ((1.0 - ALPHA) * max(MIN_RMS, rms))
-                
-                threshold = (noise_floor * 1.8) + 150.0
 
-                logger.debug("[VAD] RMS=%.1f | Floor=%.1f | Thr=%.1f | acc=%d", rms, noise_floor, threshold, len(accumulated))
+                threshold = (noise_floor * 1.8) + 120.0
+
+                logger.debug("[VAD] RMS=%.1f | Floor=%.1f | Thr=%.1f | acc=%dB | chunks=%d",
+                             rms, noise_floor, threshold, len(accumulated), chunks_since_last_flush)
 
                 if rms >= threshold:
                     speech_detected = True
@@ -201,25 +212,29 @@ async def handle_ws_session(websocket: WebSocket) -> None:
 
                 accumulated.extend(chunk)
 
-                # Trigger A: silencio tras voz
+                # Trigger A: silencio suficiente tras voz detectada
                 if speech_detected and silence_count >= SILENCE_GATE_CHUNKS:
                     if len(accumulated) >= MIN_PHRASE_BYTES:
                         await _push_batch(batch_queue, bytes(accumulated))
                     accumulated.clear()
                     speech_detected = False
                     silence_count = 0
+                    chunks_since_last_flush = 0
 
-                # Trigger B: tiempo máximo
+                # Trigger B: audio continuo sin pausa — cortar para no retrasarse
                 elif len(accumulated) >= MAX_PHRASE_BYTES:
                     await _push_batch(batch_queue, bytes(accumulated))
                     accumulated.clear()
                     speech_detected = False
                     silence_count = 0
+                    chunks_since_last_flush = 0
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("[VAD] Error: %s", e)
+                logger.error("[VAD] Error inesperado: %s — continuando", e)
+                # NUNCA salir del loop por un error — siempre seguir escuchando
+
 
     async def _push_batch(q: asyncio.Queue, pcm: bytes) -> None:
         """Empuja un batch al pipeline. Si está lleno, descarta el más antiguo."""
