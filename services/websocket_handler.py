@@ -63,12 +63,15 @@ async def handle_ws_session(websocket: WebSocket) -> None:
                     traduccion = await _run_in_thread(translate, text, detected_lang, target_lang)
                     print(f"[WS Meeting] Traducción: {traduccion!r}")
 
+                    audio_b64 = await _run_in_thread(synthesize, traduccion, target_lang)
+
                     await _safe_send(websocket, {
                         "type":          "meeting_result",
                         "transcripcion": text,
                         "traduccion":    traduccion,
                         "source_lang":   detected_lang,
                         "target_lang":   target_lang,
+                        "audio_base64":  audio_b64,
                     }, closed)
             except asyncio.TimeoutError:
                 pass
